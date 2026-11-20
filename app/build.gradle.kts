@@ -11,8 +11,8 @@ android {
         applicationId = "com.liangshuang.dshweb"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "2.0.1"
+        versionCode = 4
+        versionName = "2.0.2"
     }
 
     splits {
@@ -48,5 +48,5 @@ android {
 }
 
 dependencies {
-    implementation("org.mozilla.geckoview:geckoview:160.0.20261116130455")
+    implementation("org.mozilla.geckoview:geckoview:141.0.20250806102122")
 }
