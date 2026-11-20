@@ -1,6 +1,7 @@
 package com.liangshuang.dshweb
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -12,15 +13,6 @@ import android.view.Menu
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.CookieManager
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -28,23 +20,36 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import org.mozilla.geckoview.AllowOrDeny
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoRuntime
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.WebRequestError
+import org.mozilla.geckoview.WebResponse
 
 /**
- * dsh 网页版：一个薄壳 WebView app，用来打开云端部署的 dsh web。
+ * dsh 网页版：内嵌 Firefox 的 Gecko 引擎（GeckoView），打开云端 dsh web。
  *
- * 登录方式：dsh web 用一次性 token 链接登录，登录后 cookie 保持会话。
- * 首次使用粘贴登录链接打开一次即可；之后直接进。服务重启导致链接
- * 更换时，在菜单里选「更新登录链接」粘贴新链接。
+ * 登录方式：dsh web 用一次性 token 链接登录，登录后引擎的 cookie 保持
+ * 会话。首次使用粘贴登录链接打开一次即可；之后直接进。服务重启导致
+ * 链接更换时，在菜单里选「更新登录链接」粘贴新链接。
  */
 class MainActivity : Activity() {
 
-    private lateinit var webView: WebView
+    private lateinit var geckoView: GeckoView
+    private lateinit var session: GeckoSession
     private lateinit var progressBar: ProgressBar
     private lateinit var formView: LinearLayout
     private lateinit var linkInput: EditText
     private lateinit var formHint: TextView
 
-    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var canGoBack = false
+    private var currentUrl: String? = null
+    private var expectingTokenCheck = false
+
+    private var pendingFilePrompt: GeckoSession.PromptDelegate.FilePrompt? = null
+    private var pendingFileResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
 
     private val prefs by lazy { getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
 
@@ -54,11 +59,11 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        setupWebView()
+        setupSession()
 
         if (hasLink()) {
             showWeb()
-            webView.loadUrl(baseUrl() + "/")
+            session.loadUri(baseUrl() + "/")
         } else {
             showForm("把我发你的 dsh 登录链接粘贴到下面，打开一次就会记住登录。")
         }
@@ -82,12 +87,12 @@ class MainActivity : Activity() {
             )
         }
 
-        webView = WebView(this).apply {
+        geckoView = GeckoView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-        frame.addView(webView)
+        frame.addView(geckoView)
 
         formView = buildForm()
         frame.addView(formView)
@@ -149,7 +154,7 @@ class MainActivity : Activity() {
             ).apply { topMargin = dp(8) }
             setOnClickListener {
                 showWeb()
-                webView.loadUrl(baseUrl() + "/")
+                session.loadUri(baseUrl() + "/")
             }
         }
         form.addView(directButton)
@@ -161,12 +166,12 @@ class MainActivity : Activity() {
         formHint.text = message
         prefillFromClipboard()
         formView.visibility = View.VISIBLE
-        webView.visibility = View.GONE
+        geckoView.visibility = View.GONE
     }
 
     private fun showWeb() {
         formView.visibility = View.GONE
-        webView.visibility = View.VISIBLE
+        geckoView.visibility = View.VISIBLE
     }
 
     private fun prefillFromClipboard() {
@@ -191,114 +196,183 @@ class MainActivity : Activity() {
             .putString(KEY_BASE_URL, base)
             .putBoolean(KEY_HAS_LINK, true)
             .apply()
+        expectingTokenCheck = raw.contains("token=")
         showWeb()
-        webView.loadUrl(raw)
+        session.loadUri(raw)
     }
 
-    // ---------- WebView ----------
+    // ---------- Gecko session ----------
 
-    private fun setupWebView() {
-        val settings = webView.settings
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.databaseEnabled = true
-        settings.cacheMode = WebSettings.LOAD_DEFAULT
-        settings.mediaPlaybackRequiresUserGesture = false
-        settings.loadWithOverviewMode = true
-        settings.useWideViewPort = true
-        settings.builtInZoomControls = false
+    private fun setupSession() {
+        session = GeckoSession()
+        session.open(GeckoRuntime.getDefault(this))
+        session.settings.allowJavascript = true
 
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(webView, true)
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLocationChange(
+                session: GeckoSession,
+                url: String?,
+                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
+                hasUserGesture: Boolean
+            ) {
+                currentUrl = url
+            }
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url ?: return false
-                if (url.scheme == "http" || url.scheme == "https") return false
-                return try {
-                    startActivity(Intent(Intent.ACTION_VIEW, url))
-                    true
+            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
+                this@MainActivity.canGoBack = canGoBack
+            }
+
+            override fun onLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest
+            ): GeckoResult<AllowOrDeny>? {
+                val scheme = Uri.parse(request.uri).scheme?.lowercase()
+                if (scheme == "http" || scheme == "https" || scheme == "about" ||
+                    scheme == "blob" || scheme == "data" || scheme == "file"
+                ) {
+                    return null // 交给引擎正常加载
+                }
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(request.uri)))
                 } catch (e: Exception) {
-                    true
+                    // 没有能打开的程序就忽略
                 }
+                return GeckoResult.fromValue(AllowOrDeny.DENY)
             }
 
-            override fun onReceivedHttpError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                errorResponse: WebResourceResponse?
-            ) {
-                super.onReceivedHttpError(view, request, errorResponse)
-                if (request?.isForMainFrame == true && errorResponse?.statusCode == 401) {
-                    // dsh 服务重启后旧登录失效，需要新链接。
-                    showForm("登录已失效（云端服务重启过）。把我发你的新登录链接粘贴到下面，再打开一次。")
-                }
-            }
-
-            override fun onReceivedError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                error: WebResourceError?
-            ) {
-                super.onReceivedError(view, request, error)
-                if (request?.isForMainFrame == true) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        "页面加载失败，检查网络后点菜单里的刷新",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String>? {
+                Toast.makeText(
+                    this@MainActivity,
+                    "页面加载失败，检查网络后点菜单里的刷新",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return null
             }
         }
 
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                progressBar.progress = newProgress
-                progressBar.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
+        session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStart(session: GeckoSession, url: String) {
+                progressBar.visibility = View.VISIBLE
             }
 
-            override fun onShowFileChooser(
-                webView: WebView?,
-                filePathCallback: ValueCallback<Array<Uri>>?,
-                fileChooserParams: FileChooserParams?
-            ): Boolean {
-                // 先把上一个未完成的选择回调取消掉，再接新的。
-                this@MainActivity.filePathCallback?.onReceiveValue(null)
-                this@MainActivity.filePathCallback = filePathCallback
-                return try {
-                    val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "*/*"
+            override fun onProgressChange(session: GeckoSession, progress: Int) {
+                progressBar.progress = progress
+            }
+
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                progressBar.visibility = View.GONE
+                if (expectingTokenCheck) {
+                    expectingTokenCheck = false
+                    val u = currentUrl
+                    // token 有效时服务端会跳转到不带 token 的地址；
+                    // 还停在带 token 的地址，说明没登录进去。
+                    if (u != null && u.contains("token=")) {
+                        showForm("没能登录进去（链接可能已过期，或云端服务暂时不可用）。把我发你的最新登录链接粘贴到下面再试。")
                     }
-                    startActivityForResult(
-                        Intent.createChooser(intent, "选择文件"),
-                        REQUEST_FILE_CHOOSER
-                    )
-                    true
-                } catch (e: Exception) {
-                    this@MainActivity.filePathCallback = null
-                    false
                 }
             }
         }
 
-        webView.setDownloadListener { url, _, _, _, _ ->
-            try {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-            } catch (e: Exception) {
-                Toast.makeText(this, "没有能打开这个下载的程序", Toast.LENGTH_SHORT).show()
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+                // 引擎不直接渲染的响应（一般是文件下载）交给外部程序打开。
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(response.uri)))
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "没有能打开这个下载的程序", Toast.LENGTH_SHORT).show()
+                }
             }
         }
+
+        session.promptDelegate = object : GeckoSession.PromptDelegate {
+            override fun onFilePrompt(
+                session: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.FilePrompt
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                pendingFilePrompt = prompt
+                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                pendingFileResult = result
+                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = prompt.mimeTypes?.firstOrNull { it.contains("/") } ?: "*/*"
+                    if (prompt.type == GeckoSession.PromptDelegate.FilePrompt.Type.MULTIPLE) {
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }
+                }
+                return try {
+                    startActivityForResult(Intent.createChooser(intent, "选择文件"), REQUEST_FILE_CHOOSER)
+                    result
+                } catch (e: Exception) {
+                    pendingFilePrompt = null
+                    pendingFileResult = null
+                    GeckoResult.fromValue(prompt.dismiss())
+                }
+            }
+
+            override fun onAlertPrompt(
+                session: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.AlertPrompt
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(prompt.message ?: "")
+                    .setPositiveButton("好") { _, _ -> result.complete(prompt.dismiss()) }
+                    .setOnCancelListener { result.complete(prompt.dismiss()) }
+                    .show()
+                return result
+            }
+
+            override fun onButtonPrompt(
+                session: GeckoSession,
+                prompt: GeckoSession.PromptDelegate.ButtonPrompt
+            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? {
+                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(prompt.message ?: "")
+                    .setPositiveButton("确定") { _, _ ->
+                        result.complete(prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE))
+                    }
+                    .setNegativeButton("取消") { _, _ ->
+                        result.complete(prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE))
+                    }
+                    .setOnCancelListener {
+                        result.complete(prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE))
+                    }
+                    .show()
+                return result
+            }
+        }
+
+        geckoView.setSession(session)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_FILE_CHOOSER) {
-            filePathCallback?.onReceiveValue(
-                WebChromeClient.FileChooserParams.parseResult(resultCode, data)
-            )
-            filePathCallback = null
+            val prompt = pendingFilePrompt
+            val result = pendingFileResult
+            pendingFilePrompt = null
+            pendingFileResult = null
+            if (prompt == null || result == null) return
+            val uris = mutableListOf<Uri>()
+            if (resultCode == RESULT_OK && data != null) {
+                data.data?.let { uris.add(it) }
+                val clip = data.clipData
+                if (clip != null) {
+                    for (i in 0 until clip.itemCount) {
+                        clip.getItemAt(i)?.uri?.let { uris.add(it) }
+                    }
+                }
+            }
+            if (uris.isEmpty()) {
+                result.complete(prompt.dismiss())
+            } else {
+                result.complete(prompt.confirm(this, uris.toTypedArray()))
+            }
         }
     }
 
@@ -319,11 +393,11 @@ class MainActivity : Activity() {
                 true
             }
             MENU_REFRESH -> {
-                if (webView.visibility == View.VISIBLE) webView.reload()
+                if (geckoView.visibility == View.VISIBLE) session.reload()
                 true
             }
             MENU_OPEN_BROWSER -> {
-                val url = webView.url ?: (baseUrl() + "/")
+                val url = currentUrl ?: (baseUrl() + "/")
                 try {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                 } catch (e: Exception) {
@@ -336,20 +410,15 @@ class MainActivity : Activity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK && webView.visibility == View.VISIBLE && webView.canGoBack()) {
-            webView.goBack()
+        if (keyCode == KeyEvent.KEYCODE_BACK && geckoView.visibility == View.VISIBLE && canGoBack) {
+            session.goBack()
             return true
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    override fun onPause() {
-        super.onPause()
-        CookieManager.getInstance().flush()
-    }
-
     override fun onDestroy() {
-        webView.destroy()
+        if (::session.isInitialized) session.close()
         super.onDestroy()
     }
 
