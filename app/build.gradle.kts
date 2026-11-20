@@ -11,8 +11,17 @@ android {
         applicationId = "com.liangshuang.dshweb"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "2.0.0"
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = false
+        }
     }
 
     buildTypes {
@@ -36,4 +45,8 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    implementation("org.mozilla.geckoview:geckoview:160.0.20261116130455")
 }
